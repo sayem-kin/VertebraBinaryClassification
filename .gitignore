@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+Data/img/*
+!Data/img/.gitkeep
+
+checkpoints/*.pt
+checkpoints/*.tar
+
+.vscode/
+*.log
