@@ -8,9 +8,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+import torchvision.transforms as T
 
-# HU Windowing (Bone Window: WL=400, WW=1500)
-def window_hu(img, WL=400, WW=1500):
+
+def window_hu(img, WL=-300, WW=800):
+   
     lower = WL - WW // 2
     upper = WL + WW // 2
 
@@ -18,13 +20,11 @@ def window_hu(img, WL=400, WW=1500):
     img = (img - lower) / (upper - lower)
     return img.astype(np.float32)
 
-# Load YAML file (train/test split)
 def load_yaml_list(path: str) -> List[str]:
     with open(path, "r") as f:
         data = yaml.safe_load(f)
     return data
 
-# Extra (Already created the binary label from multiclass classification)
 def binary_label_from_filename(filename: str) -> int:
     """
     Filename format:
@@ -37,18 +37,29 @@ def binary_label_from_filename(filename: str) -> int:
     grade = int(filename.split("_")[-1].replace(".nii.gz", ""))
     return 0 if grade == 0 else 1
 
-# Dataset Class
 class VertebraSagittalDataset(Dataset):
-    def __init__(self, img_root: str, file_list: List[str], resize: int = 224):
+    def __init__(self, img_root: str, file_list: List[str],
+                 resize: int = 224, augment: bool = False):
         """
         Args:
             img_root (str): folder where vertebra .nii.gz files live
             file_list (List[str]): list of filenames from YAML
-            resize (int): final output resolution (224)
+            resize (int): final output resolution (224 recommended)
+            augment (bool): apply data augmentation (True for train only)
         """
         self.img_root = Path(img_root)
         self.file_list = file_list
         self.resize = resize
+        self.augment = augment
+
+        # Simple geometric augmentation on tensors (C, H, W)
+        if self.augment:
+            self.transform = T.Compose([
+                T.RandomRotation(degrees=10),
+                T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+            ])
+        else:
+            self.transform = None
 
     def __len__(self):
         return len(self.file_list)
@@ -59,25 +70,24 @@ class VertebraSagittalDataset(Dataset):
 
         vol = nib.load(str(full_path)).get_fdata()
 
-        # Extract sagittal slice (axis 0)
         mid = vol.shape[0] // 2
-        sag = vol[mid, :, :]   # shape (H, W)
+        sag = vol[mid, :, :]   # (H, W)
 
-        # HU windowing
-        sag = window_hu(sag)
+        
+        sag = window_hu(sag)   # np.float32 in [0,1]
 
-        # Convert to tensor, add channel 1
-        sag = torch.from_numpy(sag)[None, :, :]   # (1, H, W)
+        sag = torch.from_numpy(sag).unsqueeze(0)   # (1, H, W)
 
-        # Resize to 224x224
+        if self.transform is not None:
+            sag = self.transform(sag)
+
         sag = F.interpolate(
-            sag.unsqueeze(0),  # (1, 1, H, W)
+            sag.unsqueeze(0),      # (1, 1, H, W)
             size=(self.resize, self.resize),
             mode="bilinear",
             align_corners=False
-        ).squeeze(0)
-
-        # Extract label from filename
+        ).squeeze(0)              # (1, 224, 224)
+        
         label = binary_label_from_filename(filename)
         label = torch.tensor(label, dtype=torch.long)
 

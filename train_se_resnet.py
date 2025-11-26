@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from sklearn.metrics import (
     accuracy_score,
@@ -16,13 +16,26 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-from monai.networks.nets import SEResNet50
+from monai.networks.nets import SEResNet50, EfficientNetBN
 
 from dataset import (
     load_yaml_list,
     VertebraSagittalDataset,
     binary_label_from_filename,
 )
+
+# Focal Loss
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, labels):
+        ce = nn.functional.cross_entropy(logits, labels, reduction="none")
+        pt = torch.exp(-ce)
+        focal = self.alpha * (1 - pt) ** self.gamma * ce
+        return focal.mean()
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -45,14 +58,6 @@ def make_train_val_split(train_files, val_fraction=0.1, seed=42):
     val_split = [train_files[i] for i in val_idx]
 
     return train_split, val_split
-
-def compute_class_weights(file_list):
-    labels = [binary_label_from_filename(f) for f in file_list]
-    counts = np.bincount(labels, minlength=2)
-    counts = np.maximum(counts, 1)  # avoid zero
-    weights = 1.0 / counts
-    weights = weights * (2.0 / weights.sum())
-    return torch.tensor(weights, dtype=torch.float32)
 
 def evaluate(model, loader, device):
     model.eval()
@@ -80,7 +85,7 @@ def evaluate(model, loader, device):
 
     try:
         auc = roc_auc_score(all_labels, all_probs)
-    except:
+    except Exception:
         auc = float("nan")
 
     return {
@@ -102,6 +107,7 @@ def main(args):
     train_files_full = load_yaml_list(args.train_yaml)
     test_files = load_yaml_list(args.test_yaml)
 
+    # Train/val split
     train_files, val_files = make_train_val_split(
         train_files_full, val_fraction=args.val_fraction, seed=args.seed
     )
@@ -110,38 +116,86 @@ def main(args):
         f"Train: {len(train_files)},  Val: {len(val_files)},  Test: {len(test_files)}"
     )
 
-    
-    train_ds = VertebraSagittalDataset(img_root, train_files, resize=args.img_size)
-    val_ds = VertebraSagittalDataset(img_root, val_files, resize=args.img_size)
-    test_ds = VertebraSagittalDataset(img_root, test_files, resize=args.img_size)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-    model = SEResNet50(
-        spatial_dims=2,
-        in_channels=1,
-        num_classes=2,
-    ).to(device)
-
-    class_weights = compute_class_weights(train_files).to(device)
-    print(f"\nClass weights: {class_weights.cpu().numpy()}")
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3, verbose=True
+    train_ds = VertebraSagittalDataset(
+        img_root, train_files, resize=args.img_size, augment=True
+    )
+    val_ds = VertebraSagittalDataset(
+        img_root, val_files, resize=args.img_size, augment=False
+    )
+    test_ds = VertebraSagittalDataset(
+        img_root, test_files, resize=args.img_size, augment=False
     )
 
-    best_val_auc = -1
+    # ---------------------------
+    # Weighted sampling for imbalance
+    # ---------------------------
+    train_labels = [binary_label_from_filename(f) for f in train_files]
+    class_counts = np.bincount(train_labels, minlength=2)
+    class_weights_sampler = 1.0 / class_counts
+    sample_weights = [class_weights_sampler[l] for l in train_labels]
+    sample_weights = torch.DoubleTensor(sample_weights)
+
+    train_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    print(f"Class counts (train): {class_counts}")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    if args.backbone == "efficientnet-b3":
+        model = EfficientNetBN(
+            model_name="efficientnet-b3",
+            spatial_dims=2,
+            in_channels=1,
+            num_classes=2,
+        ).to(device)
+    else:
+        model = SEResNet50(
+            spatial_dims=2,
+            in_channels=1,
+            num_classes=2,
+        ).to(device)
+
+    criterion = FocalLoss(alpha=0.75, gamma=2.0)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr, weight_decay=1e-4
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs
+    )
+
+    best_val_auc = -1.0
     best_epoch = -1
     os.makedirs(args.out_dir, exist_ok=True)
     pt_path = Path(args.out_dir) / "best_model.pt"
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        running_loss = 0
+        running_loss = 0.0
         batches = 0
 
         for imgs, labels, _ in train_loader:
@@ -157,10 +211,10 @@ def main(args):
             running_loss += loss.item()
             batches += 1
 
-        train_loss = running_loss / batches
+        train_loss = running_loss / max(batches, 1)
 
         val_metrics = evaluate(model, val_loader, device)
-        scheduler.step(val_metrics["auc"])
+        scheduler.step()
 
         print(
             f"Epoch {epoch}/{args.epochs} | "
@@ -173,6 +227,7 @@ def main(args):
         if val_metrics["auc"] > best_val_auc:
             best_val_auc = val_metrics["auc"]
             best_epoch = epoch
+
             torch.save(
                 {
                     "epoch": epoch,
@@ -184,21 +239,25 @@ def main(args):
                 pt_path,
             )
 
-            tar_path = Path(args.out_dir) / f"best_ckpt_epoch{epoch}_{best_val_auc:.4f}.tar"
+            tar_path = (
+                Path(args.out_dir)
+                / f"best_ckpt_epoch{epoch}_{best_val_auc:.4f}.tar"
+            )
             torch.save(
                 {
                     "epoch": epoch,
-                    "state_dict": model.state_dict(),  
+                    "state_dict": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "val_auc": best_val_auc,
                 },
                 tar_path,
             )
 
-            print(f"  --> Best model updated. Saved .pt and .tar\n")
+            print("  --> Best model updated. Saved .pt and .tar\n")
 
     print(f"\nTraining done. Best epoch = {best_epoch} with AUC = {best_val_auc:.4f}")
     print(f"Best model (.pt): {pt_path}")
+
 
     print("\n=== TEST EVALUATION ===")
 
@@ -212,7 +271,11 @@ def main(args):
     print(f"Test AUC:      {test_metrics['auc']:.4f}")
 
     print("\nClassification Report:")
-    print(classification_report(test_metrics["y_true"], test_metrics["y_pred"], digits=4))
+    print(
+        classification_report(
+            test_metrics["y_true"], test_metrics["y_pred"], digits=4
+        )
+    )
 
     print("\nConfusion Matrix:")
     print(confusion_matrix(test_metrics["y_true"], test_metrics["y_pred"]))
@@ -231,6 +294,12 @@ if __name__ == "__main__":
     parser.add_argument("--val_fraction", type=float, default=0.1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="seresnet50", 
+        choices=["efficientnet-b3", "seresnet50"],
+    )
 
     args = parser.parse_args()
     main(args)
